@@ -8,6 +8,7 @@ const { parse } = require('csv-parse/sync');
 
 const ANKI_CONNECT_URL = 'http://localhost:8765';
 
+// Utility functions
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function ankiInvoke(action, params = {}) {
@@ -20,6 +21,7 @@ async function ankiInvoke(action, params = {}) {
   return data.result;
 }
 
+// Anki deck level configurations
 const DECK_LEVELS = [
   { range: [1, 20], name: '1 - Absolute Beginner' },
   { range: [21, 40], name: '2 - Early Beginner' },
@@ -31,11 +33,13 @@ const DECK_LEVELS = [
   { range: [141, 160], name: '8 - Intermediate' }
 ];
 
+// Mapping for extra stories to deck levels
 const EXTRA_MAP = [
   [1, 2], [3, 4], [5, 6], [7, 8],
   [9, 10], [11, 12], [13, 14], [15, 16]
 ];
 
+// Deck name mapping functions
 function getSerialCourseDeckName(fileName) {
   const baseName = path.basename(fileName, '.csv');
   const lower = fileName.toLowerCase();
@@ -44,14 +48,14 @@ function getSerialCourseDeckName(fileName) {
 
   const lessonMatch = fileName.match(/lesson (\d+)/i);
   if (lessonMatch) {
-    const lessonNum = +lessonMatch[1];
+    const lessonNum = parseInt(lessonMatch[1]);
     const level = DECK_LEVELS.find(l => lessonNum >= l.range[0] && lessonNum <= l.range[1]);
     return level ? `${level.name}::${baseName}` : `Other::${baseName}`;
   }
 
   const extraMatch = fileName.match(/extra sentences (\d+)/i);
   if (extraMatch) {
-    const extraNum = +extraMatch[1];
+    const extraNum = parseInt(extraMatch[1]);
     const idx = EXTRA_MAP.findIndex(arr => arr.includes(extraNum));
     const level = DECK_LEVELS[idx];
     return level ? `${level.name}::${baseName}` : `Other::${baseName}`;
@@ -60,36 +64,83 @@ function getSerialCourseDeckName(fileName) {
   return `Other::${baseName}`;
 }
 
-async function importAnkiDeck(config) {
-  const fullDirPath = path.join(__dirname, config.dir);
+function getVocabDeckName(lessonId) {
+  if (lessonId.startsWith('S')) {
+    return `Special::Lesson ${lessonId}`;
+  }
+
+  const lessonNum = parseInt(lessonId);
+  if (isNaN(lessonNum)) {
+    return `Other::Lesson ${lessonId}`;
+  }
+
+  const level = DECK_LEVELS.find(l => lessonNum >= l.range[0] && lessonNum <= l.range[1]);
+  return level ? `${level.name}::Lesson ${lessonId}` : `Other::Lesson ${lessonId}`;
+}
+
+async function createNotesForDeck(deckName, records, config, allowDuplicate = false) {
+  const notes = records.map(row => ({
+    deckName,
+    modelName: config.noteType,
+    fields: config.parseFields(row),
+    options: { allowDuplicate }
+  }));
+
+  try {
+    await ankiInvoke('createDeck', { deck: deckName });
+    await sleep(1);
+    await ankiInvoke('addNotes', { notes });
+    return notes.length;
+  } catch (e) {
+    console.error(`Failed to import into ${deckName}:`, e);
+    return 0;
+  }
+}
+
+async function importDeck(config) {
+  const fullDirPath = path.join(__dirname, '..', config.dir);
   if (!fs.existsSync(fullDirPath)) return;
 
   const files = fs.readdirSync(fullDirPath).filter(config.fileFilter);
   for (const file of files) {
-    const deckName = `${config.deckPrefix}${config.mapDeckName(file)}`;
     const csvPath = path.join(fullDirPath, file);
     const content = fs.readFileSync(csvPath, 'utf8');
     const records = parse(content, { skip_empty_lines: true });
 
-    const notes = records.map(row => ({
-      deckName,
-      modelName: config.noteType,
-      fields: config.parseFields(row),
-      options: { allowDuplicate: false }
-    }));
+    if (config.isVocab) {
+      // Group records by lesson ID for vocab decks
+      const lessonGroups = records.reduce((groups, row) => {
+        const lessonId = row[0];
+        if (!groups[lessonId]) {
+          groups[lessonId] = [];
+        }
+        groups[lessonId].push(row);
+        return groups;
+      }, {});
 
-    try {
-      await ankiInvoke('createDeck', { deck: deckName });
+      for (const [lessonId, lessonRecords] of Object.entries(lessonGroups)) {
+        const deckName = `${config.deckPrefix}${config.mapDeckName(lessonId)}`;
+        const importedCount = await createNotesForDeck(deckName, lessonRecords, config, config.allowDuplicate);
+
+        if (importedCount > 0) {
+          console.log(`Imported Lesson ${lessonId} (${importedCount} cards) into deck: ${deckName}`);
+        }
+        await sleep(1);
+      }
+    } else {
+      // Process entire file as single deck for standard decks
+      const deckName = `${config.deckPrefix}${config.mapDeckName(file)}`;
+      const importedCount = await createNotesForDeck(deckName, records, config, config.allowDuplicate);
+
+      if (importedCount > 0) {
+        console.log(`Imported ${file} (${importedCount} cards) into deck: ${deckName}`);
+      }
       await sleep(1);
-      await ankiInvoke('addNotes', { notes });
-      console.log(`Imported ${file} into deck: ${deckName}`);
-    } catch (e) {
-      console.error(`Failed to import ${file} into ${deckName}:`, e);
     }
-    await sleep(1);
   }
 }
 
+// Configuration for different import types
 const IMPORT_CONFIGS = [
   {
     name: 'Serial Course',
@@ -107,7 +158,8 @@ const IMPORT_CONFIGS = [
       Notes: notes,
       Audio: audio,
       'Audio Slow': audioslow
-    })
+    }),
+    allowDuplicate: false
   },
   {
     name: 'Pronunciation',
@@ -115,19 +167,39 @@ const IMPORT_CONFIGS = [
     deckPrefix: 'IC::Pronounciation::',
     noteType: 'IC Pronounciation',
     fileFilter: f => f.endsWith('.csv'),
-    mapDeckName: file => `${file}`,
+    mapDeckName: file => file,
     parseFields: ([id, pinyin, description, audio]) => ({
       ID: id,
       Pinyin: pinyin,
       Description: description,
       Audio: audio
-    })
+    }),
+    allowDuplicate: false
+  },
+  {
+    name: 'Vocab',
+    dir: 'dist/vocab',
+    deckPrefix: 'IC::Vocab::',
+    noteType: 'IC Vocab',
+    fileFilter: f => f.endsWith('.csv'),
+    mapDeckName: getVocabDeckName,
+    parseFields: ([lesson, simplified, traditional, pinyin, english, audio]) => ({
+      ID: lesson,
+      Simplified: simplified,
+      Traditional: traditional,
+      Pinyin: pinyin,
+      English: english,
+      Audio: audio
+    }),
+    isVocab: true,
+    allowDuplicate: true
   }
 ];
 
 async function main() {
   for (const config of IMPORT_CONFIGS) {
-    await importAnkiDeck(config);
+    console.log(`Starting import for ${config.name}...`);
+    await importDeck(config);
   }
   console.log('All imports complete.');
 }
